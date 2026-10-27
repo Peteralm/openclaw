@@ -34,13 +34,39 @@ const now = 1_800_000_000_000;
 const searchKeys = (params: SessionListFilterParams) =>
   filterSessionEntries(params).entries.map(([key]) => key);
 
-function searchTargets(rows: [string, SessionEntry][]) {
-  return new Map(
+function searchFixture(
+  cfg: SessionListFilterParams["cfg"],
+  rows: [string, SessionEntry][],
+  rowContext: ReturnType<typeof buildSessionListRowMetadataContext>,
+  modelRows?: () => Parameters<typeof modelFacts.mayMatchSessionRowModelSearch>[0]["rows"],
+): SessionListFilterParams {
+  const targets = new Map(
     rows.map(([key, entry]) => [
       key,
       { agentId: key.split(":")[1]!, entry, selection: readSessionListSelectionFacts(key, entry) },
     ]),
   );
+  const params: SessionListFilterParams = {
+    cfg,
+    opts: {},
+    now,
+    entries: () => rows,
+    getTarget: (key) => targets.get(key),
+    configuredAgentIds: new Set(rows.map(([key]) => key.split(":")[1]!)),
+    getRowContext: () => rowContext,
+    involvementKeys: () => new Set(),
+    modelSearchMayMatch: (search) =>
+      modelFacts.mayMatchSessionRowModelSearch(
+        {
+          cfg,
+          rowContext,
+          modelCatalog: params.modelCatalog,
+          rows: modelRows?.() ?? targets.values(),
+        },
+        search,
+      ),
+  };
+  return params;
 }
 
 test("non-status vocabulary misses skip per-row run state and model facts", () => {
@@ -56,7 +82,6 @@ test("non-status vocabulary misses skip per-row run state and model facts", () =
       modelOverride: "raw-alias",
     },
   ]);
-  const targets = searchTargets(rows);
   const normalizeModelId = vi.fn(({ modelId }: ProviderNormalizeModelIdContext) =>
     modelId === "raw-alias" ? "hidden-canonical" : modelId,
   );
@@ -67,7 +92,7 @@ test("non-status vocabulary misses skip per-row run state and model facts", () =
     provider: { id: "fixture", label: "Fixture", auth: [], normalizeModelId },
   });
   const getModelFacts = vi.fn<SessionListModelFactsLookup>((key) => {
-    const entry = targets.get(key)!.entry;
+    const entry = params.getTarget(key)!.entry;
     const selectedModel = resolveSessionSelectedModelRef({
       cfg: params.cfg,
       agentId: "main",
@@ -86,31 +111,19 @@ test("non-status vocabulary misses skip per-row run state and model facts", () =
       },
     };
   });
-  const params: SessionListFilterParams = {
-    cfg: { agents: { defaults: { model: "openai/gpt-4.1" }, entries: { main: {} } } },
-    opts: { search: "zz-no-match" },
-    now,
-    entries: () => rows,
-    getTarget: (key) => targets.get(key),
-    getModelFacts,
-    modelCatalog: [{ provider: "fixture", id: "raw-alias", name: "Fixture" }],
-    modelSearchMayMatch: (search) =>
-      modelFacts.mayMatchSessionRowModelSearch(
-        {
-          cfg: params.cfg,
-          modelCatalog: params.modelCatalog,
-          rowContext,
-          rows: rows.map(([, entry]) => ({ agentId: "main", entry })),
-        },
-        search,
-      ),
-    configuredAgentIds: new Set(["main"]),
-    getRowContext: () => rowContext,
-    involvementKeys: () => new Set(),
-    projectActiveRun,
-  };
+  const params: SessionListFilterParams = searchFixture(
+    { agents: { defaults: { model: "openai/gpt-4.1" }, entries: { main: {} } } },
+    rows,
+    rowContext,
+  );
+  params.opts.search = "zz-no-match";
+  params.getModelFacts = getModelFacts;
+  params.modelCatalog = [{ provider: "fixture", id: "raw-alias", name: "Fixture" }];
+  params.projectActiveRun = projectActiveRun;
   withPluginRuntimeRegistryScope(registry, () => {
+    using probe = vi.spyOn(String.prototype, "includes");
     expect(filterSessionEntries(params).entries).toEqual([]);
+    expect(probe.mock.contexts).not.toContain("");
     expect(projectActiveRun).not.toHaveBeenCalled();
     expect(getModelFacts).not.toHaveBeenCalled();
     expect(normalizeModelId).toHaveBeenCalledOnce();
@@ -170,7 +183,6 @@ test("native models and prepared runtime labels outside the catalog retain their
   };
   const key = "agent:main:fixture";
   const entry: SessionEntry = { sessionId: "fixture", updatedAt: now, status: "done" };
-  const targets = searchTargets([[key, entry]]);
   const ownership: AgentHarnessSessionRuntimeOwnership = {
     model: "native",
     auth: "native",
@@ -199,30 +211,12 @@ test("native models and prepared runtime labels outside the catalog retain their
       source: { entry, readSourceEntry: () => undefined },
     }),
   );
-  const params: SessionListFilterParams = {
-    cfg,
-    opts: {},
-    now,
-    entries: () => [[key, entry]],
-    getTarget: (sessionKey) => targets.get(sessionKey),
-    getModelFacts,
-    modelSearchMayMatch: (search) =>
-      modelFacts.mayMatchSessionRowModelSearch(
-        {
-          cfg,
-          rowContext,
-          modelCatalog: [],
-          rows: [
-            { agentId: "main", entry, preparedRuntimeOwnership: ownership, preparedAcpMeta: acp },
-          ],
-        },
-        search,
-      ),
-    configuredAgentIds: new Set(["main"]),
-    getRowContext: () => rowContext,
-    involvementKeys: () => new Set(),
-    projectActiveRun: () => ({ active: false }),
-  };
+  const params: SessionListFilterParams = searchFixture(cfg, [[key, entry]], rowContext, () => [
+    { agentId: "main", entry, preparedRuntimeOwnership: ownership, preparedAcpMeta: acp },
+  ]);
+  params.getModelFacts = getModelFacts;
+  params.modelCatalog = [];
+  params.projectActiveRun = () => ({ active: false });
   const assertSearch = (search: string, factReads: number) => {
     params.opts = { search };
     const expected = eagerSearch(params, key, entry);
@@ -380,7 +374,6 @@ test("search preserves the eager predicate's rows and order across vocabulary su
             },
     },
   ]);
-  const targets = searchTargets(rows);
   const runs = rows
     .filter((_, index) => index % 5 === 0)
     .map(([key], index) => ({
@@ -422,43 +415,31 @@ test("search preserves the eager predicate's rows and order across vocabulary su
       },
     ]),
   );
-  const params: SessionListFilterParams = {
-    cfg: {
+  const params: SessionListFilterParams = searchFixture(
+    {
       agents: {
         defaults: { model: "openai/gpt-4.1" },
         entries: { main: {}, research: { model: "anthropic/claude-sonnet-4" } },
       },
     },
-    opts: {},
-    now,
-    entries: () => rows,
-    getTarget: (key) => targets.get(key),
-    getModelFacts: (key) => facts.get(key)!,
-    modelSearchMayMatch: (search) =>
-      modelFacts.mayMatchSessionRowModelSearch(
-        {
-          cfg: params.cfg,
-          rowContext,
-          rows: rows.map(([key, entry]) => ({
-            agentId: targets.get(key)!.agentId,
-            entry,
-            materialized: { source: facts.get(key)! },
-          })),
-        },
-        search,
-      ),
-    configuredAgentIds: new Set(["main", "research"]),
-    identityNames: new Map([
-      ["main", "Helpful Assistant"],
-      ["research", "Research Partner"],
-    ]),
-    getRowContext: () => rowContext,
-    involvementKeys: () => new Set(),
-    projectActiveRun: (_key, entry) => ({
-      active: entry.updatedAt! % 4 === 0,
-      status: entry.updatedAt! % 8 ? undefined : "queued",
-    }),
-  };
+    rows,
+    rowContext,
+    () =>
+      rows.map(([key, entry]) => ({
+        agentId: params.getTarget(key)!.agentId,
+        entry,
+        materialized: { source: facts.get(key)! },
+      })),
+  );
+  params.getModelFacts = (key) => facts.get(key)!;
+  params.identityNames = new Map([
+    ["main", "Helpful Assistant"],
+    ["research", "Research Partner"],
+  ]);
+  params.projectActiveRun = (_key, entry) => ({
+    active: entry.updatedAt! % 4 === 0,
+    status: entry.updatedAt! % 8 ? undefined : "queued",
+  });
   const vocabulary = [
     "",
     "zz-no-match",
@@ -492,7 +473,7 @@ test("search preserves the eager predicate's rows and order across vocabulary su
       resolveSessionModelIdentityRef(
         params.cfg,
         entry,
-        targets.get(key)!.agentId,
+        params.getTarget(key)!.agentId,
         rowContext.subagentRuns.getDisplaySubagentRun(key)?.model,
         { allowPluginNormalization: false },
       ),
